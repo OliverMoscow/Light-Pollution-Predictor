@@ -3,6 +3,7 @@ import os
 import time
 import numpy as np
 import shapefile
+import matplotlib.pyplot as plt
 from pyproj import Transformer
 from sklearn import linear_model
 
@@ -226,14 +227,14 @@ def build_regression_matrix(sample_points):
         nlcd_onehot = _nlcd_mode_within(lat, lon)
         # biz_count = _count_businesses_within(lat, lon)
 
-        # county_name = _find_county(_county_data[0], _county_data[1], lat, lon)
-        # if county_name and county_name in _ordinances:
-        #     ordinance_vec = _ordinances[county_name]
-        # else:
-        #     ordinance_vec = [0, 0, 0, 0]
+        county_name = _find_county(_county_data[0], _county_data[1], lat, lon)
+        if county_name and county_name in _ordinances:
+            ordinance_vec = _ordinances[county_name]
+        else:
+            ordinance_vec = [0, 0, 0, 0]
 
         # X_rows.append(nlcd_onehot + [biz_count] + ordinance_vec)
-        X_rows.append(nlcd_onehot)
+        X_rows.append(nlcd_onehot + ordinance_vec)
         y_vals.append(float(viirs_val))
 
         if (i + 1) % 100 == 0:
@@ -259,6 +260,19 @@ def linearRegression(sample_points):
         print(f"  {name}: {coef:.6f}")
     print(f"  intercept:  {reg.intercept_:.6f}")
     print(f"  R² score:   {reg.score(X, y):.4f}")
+
+    y_pred = reg.predict(X)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(y, y_pred, alpha=0.4, s=10, label="samples")
+    lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
+    ax.plot(lims, lims, "r--", linewidth=1, label="perfect fit")
+    ax.set_xlabel("Actual VIIRS radiance")
+    ax.set_ylabel("Predicted VIIRS radiance")
+    ax.set_title(f"Predicted vs Actual VIIRS  (R²={reg.score(X, y):.4f})")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
     return reg, X, y
 
 
