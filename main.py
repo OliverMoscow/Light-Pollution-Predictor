@@ -130,47 +130,6 @@ def get_business_at(lat, lon):
     idx = int(np.argmin(dist_km))
     return _businesses["names"][idx]
 
-
-def _count_businesses_within(lat, lon, radius_km=RADIUS_KM):
-    """Count businesses within radius_km of (lat, lon)."""
-    _ensure_businesses()
-    dist_km = _haversine_km(lat, lon, _businesses["lats"], _businesses["lons"])
-    return int(np.sum(dist_km <= radius_km))
-
-
-def _nlcd_mode_within(lat, lon, radius_ft=RADIUS_FT):
-    """Return the modal NLCD class within radius_ft feet as a one-hot vector."""
-    header, data = _nlcd_data
-    proj_x, proj_y = _to_albers.transform(lon, lat)
-
-    cellsize = header["cellsize"]
-    ncols = int(header["ncols"])
-    nrows = int(header["nrows"])
-    xll = header["xllcorner"]
-    yll = header["yllcorner"]
-    nodata = header["nodata_value"]
-    radius_cells = int(np.ceil((radius_ft * 0.3048) / cellsize))
-
-    center_col = int((proj_x - xll) / cellsize)
-    center_row = int((yll + nrows * cellsize - proj_y) / cellsize)
-
-    values = []
-    for dr in range(-radius_cells, radius_cells + 1):
-        for dc in range(-radius_cells, radius_cells + 1):
-            if dr ** 2 + dc ** 2 > radius_cells ** 2:
-                continue
-            r, c = center_row + dr, center_col + dc
-            if 0 <= r < nrows and 0 <= c < ncols:
-                val = int(data[r][c])
-                if val != nodata:
-                    values.append(val)
-
-    if not values:
-        return [0] * len(NLCD_CLASSES)
-    mode_class = max(set(values), key=values.count)
-    return [1 if cls == mode_class else 0 for cls in NLCD_CLASSES]
-
-
 def _load_ordinances(filepath):
     ordinances = {}
     with open(filepath) as f:
@@ -208,49 +167,127 @@ def get_dark_sky_data(lat, lon):
         "ordinances": ordinance_vec,
     }
 
-def build_regression_matrix(sample_points):
-    """Build feature matrix X and target vector y for linear regression.
+def _precompute_nlcd_fracs():
+    """Precompute the fraction of each NLCD class within RADIUS_FT for every cell.
+    Returns float16 array of shape (15, nrows, ncols) where each value is the
+    proportion of that class within the circular neighborhood (sums to 1 per cell)."""
+    from scipy.ndimage import convolve
+    header, data = _nlcd_data
+    cellsize = header["cellsize"]
+    radius_cells = int(np.ceil((RADIUS_FT * 0.3048) / cellsize))
 
-    For each (lat, lon) in sample_points the feature row contains:
-      - 15 NLCD one-hot features (modal land-cover class within 250 ft)
-      - 1  business count within 250 ft
-      - 4  ordinance flags (Fully_Shielded, Max_Limit, Floodlights, Height_Restrictions)
-    Target y is the VIIRS radiance value at that point.
-    Points where VIIRS data is missing are skipped.
-    """
-    X_rows, y_vals = [], []
-    for i, (lat, lon) in enumerate(sample_points):
-        viirs_val = _grid_lookup(_viirs_data[0], _viirs_data[1], lat, lon)
-        if viirs_val is None:
+    # Circular footprint
+    d = np.arange(-radius_cells, radius_cells + 1)
+    xx, yy = np.meshgrid(d, d)
+    footprint = (xx ** 2 + yy ** 2 <= radius_cells ** 2).astype(np.float32)
+
+    # One convolution per class → count of that class within radius at every cell
+    counts = np.zeros((len(NLCD_CLASSES), data.shape[0], data.shape[1]), dtype=np.float32)
+    for k, cls in enumerate(NLCD_CLASSES):
+        binary = (data == cls).astype(np.float32)
+        counts[k] = convolve(binary, footprint, mode="constant", cval=0)
+
+    total = counts.sum(axis=0)
+    # Divide each class count by total to get proportion; 0 where no data
+    fracs = np.where(total > 0, counts / np.maximum(total, 1), 0).astype(np.float16)
+    return fracs
+
+
+def _precompute_county_grid():
+    """Rasterize county assignments onto the VIIRS grid.
+    Returns an int16 array (nrows, ncols) with the county index, or -1."""
+    from matplotlib.path import Path
+    header, _ = _viirs_data
+    nrows = int(header["nrows"])
+    ncols = int(header["ncols"])
+    xll = header["xllcorner"]
+    yll = header["yllcorner"]
+    cellsize = header["cellsize"]
+
+    lats_vec = yll + (nrows - np.arange(nrows) - 0.5) * cellsize
+    lons_vec = xll + (np.arange(ncols) + 0.5) * cellsize
+    lon_mesh, lat_mesh = np.meshgrid(lons_vec, lats_vec)
+    pts = np.column_stack([lon_mesh.ravel(), lat_mesh.ravel()])  # (N, 2)
+
+    shapes, _ = _county_data
+    county_grid = np.full(nrows * ncols, -1, dtype=np.int16)
+    for i, s in enumerate(shapes):
+        bb = s.bbox
+        bbox_mask = ((pts[:, 0] >= bb[0]) & (pts[:, 0] <= bb[2]) &
+                     (pts[:, 1] >= bb[1]) & (pts[:, 1] <= bb[3]))
+        if not bbox_mask.any():
             continue
+        inside = np.zeros(len(pts), dtype=bool)
+        inside[bbox_mask] = Path(s.points).contains_points(pts[bbox_mask])
+        county_grid[inside] = i
 
-        nlcd_onehot = _nlcd_mode_within(lat, lon)
-        # biz_count = _count_businesses_within(lat, lon)
+    return county_grid.reshape(nrows, ncols)
 
-        county_name = _find_county(_county_data[0], _county_data[1], lat, lon)
-        if county_name and county_name in _ordinances:
-            ordinance_vec = _ordinances[county_name]
-        else:
-            ordinance_vec = [0, 0, 0, 0]
 
-        # X_rows.append(nlcd_onehot + [biz_count] + ordinance_vec)
-        X_rows.append(nlcd_onehot + ordinance_vec)
-        y_vals.append(float(viirs_val))
+def build_regression_matrix(nlcd_fracs, county_grid):
+    """Build feature matrix X and target vector y using precomputed rasters.
+    All lookups are vectorized numpy array indexing — no Python loops over points.
 
-        if (i + 1) % 100 == 0:
-            print(f"  processed {i + 1}/{len(sample_points)} points ({len(y_vals)} valid)",
-                  flush=True)
+    Features per point:
+      - 15 NLCD fraction features (proportion of each class within 250 ft)
+      - 4  ordinance flags (Fully_Shielded, Max_Limit, Floodlights, Height_Restrictions)
+    Target y is the VIIRS radiance value.
+    """
+    v_header, v_data = _viirs_data
+    n_header, _ = _nlcd_data
+    _, county_names = _county_data
 
-    X = np.array(X_rows, dtype=np.float32)
-    y = np.array(y_vals, dtype=np.float32)
+    nrows_v = int(v_header["nrows"])
+    xll_v, yll_v = v_header["xllcorner"], v_header["yllcorner"]
+    cs_v = v_header["cellsize"]
+    nodata_v = v_header["nodata_value"]
+
+    xll_n, yll_n = n_header["xllcorner"], n_header["yllcorner"]
+    cs_n = n_header["cellsize"]
+    nrows_n, ncols_n = int(n_header["nrows"]), int(n_header["ncols"])
+
+    # All valid VIIRS cells
+    v_rows, v_cols = np.where(v_data != nodata_v)
+    y = v_data[v_rows, v_cols].astype(np.float32)
+
+    # Cell-center coordinates
+    lats = yll_v + (nrows_v - v_rows - 0.5) * cs_v
+    lons = xll_v + (v_cols + 0.5) * cs_v
+
+    # NLCD: batch-transform to Albers → index into precomputed fractions raster
+    proj_xs, proj_ys = _to_albers.transform(lons, lats)
+    n_cols = np.clip(((proj_xs - xll_n) / cs_n).astype(int), 0, ncols_n - 1)
+    n_rows = np.clip(((yll_n + nrows_n * cs_n - proj_ys) / cs_n).astype(int), 0, nrows_n - 1)
+    # nlcd_fracs shape: (15, nrows, ncols) → index to get (15, n_pts) → transpose to (n_pts, 15)
+    nlcd_matrix = nlcd_fracs[:, n_rows, n_cols].T.astype(np.float32)
+
+    # Ordinances: county index → ordinance vector
+    c_idx = county_grid[v_rows, v_cols]
+    ordinance_matrix = np.zeros((len(y), 4), dtype=np.float32)
+    for ci, name in enumerate(county_names):
+        if name in _ordinances:
+            ordinance_matrix[c_idx == ci] = _ordinances[name]
+
+    X = np.hstack([nlcd_matrix, ordinance_matrix])
     return X, y
 
 
-def linearRegression(sample_points):
-    """Fit and report a linear regression model over the given sample points."""
-    print(f"Building matrix for {len(sample_points)} sample points...", flush=True)
-    X, y = build_regression_matrix(sample_points)
-    print(f"Matrix shape: X={X.shape}, y={y.shape}", flush=True)
+def linearRegression():
+    """Precompute rasters, build the matrix, fit and report the linear regression."""
+    print("Precomputing NLCD fraction raster (15 convolutions)...", flush=True)
+    t0 = time.perf_counter()
+    nlcd_fracs = _precompute_nlcd_fracs()
+    print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True)
+
+    print("Rasterizing counties onto VIIRS grid...", flush=True)
+    t0 = time.perf_counter()
+    county_grid = _precompute_county_grid()
+    print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True)
+
+    print("Building regression matrix...", flush=True)
+    t0 = time.perf_counter()
+    X, y = build_regression_matrix(nlcd_fracs, county_grid)
+    print(f"  done ({time.perf_counter() - t0:.1f}s)  shape: X={X.shape}, y={y.shape}", flush=True)
 
     reg = linear_model.LinearRegression()
     reg.fit(X, y)
@@ -274,26 +311,6 @@ def linearRegression(sample_points):
     plt.show()
 
     return reg, X, y
-
-
-
-
-def _geocode_address(address):
-    import urllib.request
-    import urllib.parse
-    import json
-    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode({
-        "q": address,
-        "format": "json",
-        "limit": 1,
-    })
-    req = urllib.request.Request(url, headers={"User-Agent": "dark-sky-research/1.0"})
-    with urllib.request.urlopen(req) as resp:
-        results = json.loads(resp.read())
-    if not results:
-        return None, None
-    return float(results[0]["lat"]), float(results[0]["lon"])
-
 
 def _preload_data():
     global _viirs_data, _nlcd_data, _county_data, _ordinances
@@ -325,11 +342,4 @@ if __name__ == "__main__":
         print(result)
 
     elif mode == "2":
-        # Sample a regular grid over Colorado's bounding box.
-        # Step ~0.1° ≈ 7 miles; gives ~2,400 candidate points before VIIRS filtering.
-        step = float(input("Grid step in degrees (e.g. 0.1): ").strip() or "0.1")
-        lats = np.arange(37.0, 41.01, step)
-        lons = np.arange(-109.05, -102.04, step)
-        sample_points = [(la, lo) for la in lats for lo in lons]
-        print(f"Generated {len(sample_points)} candidate grid points.")
-        linearRegression(sample_points)
+        linearRegression()
