@@ -5,33 +5,21 @@ import numpy as np
 import shapefile
 import matplotlib.pyplot as plt
 from pyproj import Transformer
+from scipy.spatial import KDTree
+from matplotlib.path import Path
 from sklearn import linear_model
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-_viirs_data = None
-_nlcd_data = None
-_county_data = None
-_ordinances = None
-_businesses = None  # dict: "lats", "lons" (np arrays), "names" (list)
-# Converts lat/lon (EPSG:4326) to Albers Equal Area meters (EPSG:5070),
-# which is the projected coordinate system the NLCD raster uses.
-_to_albers = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
+RADIUS_KM = 0.5  # search radius for nearby businesses
 
-RADIUS_FT = 250
-RADIUS_KM = RADIUS_FT * 0.0003048  # ~0.0762 km
-
-# All NLCD 2016 land cover class codes
-NLCD_CLASSES = [11, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95]
-
-FEATURE_NAMES = (
-    [f"nlcd_{c}" for c in NLCD_CLASSES]
-    + ["business_count"]
-    + ["fully_shielded", "max_limit", "floodlights", "height_restrictions"]
-)
+BUSINESS_SOURCES = {
+    "entities": "Business_Entities_in_Colorado_Geocoded.csv",
+    "osm":      "osm_businesses_colorado.csv",
+}
 
 
-def _parse_asc(filepath, dtype=np.float32):
+def parse_asc(filepath, dtype=np.float32):
     with open(filepath) as f:
         header = {}
         for _ in range(6):
@@ -41,102 +29,23 @@ def _parse_asc(filepath, dtype=np.float32):
     return header, data
 
 
-def _grid_lookup(header, data, lat, lon):
-    ncols = int(header["ncols"])
-    nrows = int(header["nrows"])
-    xll = header["xllcorner"]
-    yll = header["yllcorner"]
-    cellsize = header["cellsize"]
-    nodata = header["nodata_value"]
-
-    col = int((lon - xll) / cellsize)
-    row = int((yll + nrows * cellsize - lat) / cellsize)
-
-    if not (0 <= row < nrows and 0 <= col < ncols):
-        return None
-
-    val = data[row][col]
-    if val == nodata:
-        return None
-    return val
-
-def _point_in_polygon(x, y, points, parts):
-    inside = False
-    for i, start in enumerate(parts):
-        end = parts[i + 1] if i + 1 < len(parts) else len(points)
-        ring = points[start:end]
-        n = len(ring)
-        j = n - 1
-        for k in range(n):
-            xi, yi = ring[k]
-            xj, yj = ring[j]
-            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
-                inside = not inside
-            j = k
-    return inside
-
-
-def _load_county_data(filepath):
-    sf = shapefile.Reader(filepath)
-    shapes = sf.shapes()
-    names = [rec["NAME"] for rec in sf.iterRecords()]
-    return shapes, names
-
-
-def _find_county(shapes, names, lat, lon):
-    for i, s in enumerate(shapes):
-        bbox = s.bbox
-        if not (bbox[0] <= lon <= bbox[2] and bbox[1] <= lat <= bbox[3]):
-            continue
-        if _point_in_polygon(lon, lat, s.points, s.parts):
-            return names[i]
-    return None
-
-
-def _load_businesses(filepath):
-    names, lats, lons = [], [], []
+def load_businesses(filepath):
+    lats, lons = [], []
     with open(filepath, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             try:
                 lats.append(float(row["latitude"]))
                 lons.append(float(row["longitude"]))
-                names.append(row["entityname"])
             except (ValueError, KeyError):
-                pass  # skip rows with missing/invalid coords
-    return {"lats": np.array(lats), "lons": np.array(lons), "names": names}
+                pass
+    return np.array(lats), np.array(lons)
 
 
-def _haversine_km(lat, lon, lats_arr, lons_arr):
-    """Vectorized haversine distance from (lat, lon) to arrays of coords."""
-    dlat = np.radians(lats_arr - lat)
-    dlon = np.radians(lons_arr - lon)
-    a = (np.sin(dlat / 2) ** 2
-         + np.cos(np.radians(lat)) * np.cos(np.radians(lats_arr)) * np.sin(dlon / 2) ** 2)
-    return 6371.0 * 2 * np.arcsin(np.sqrt(a))
-
-
-def _ensure_businesses():
-    global _businesses
-    if _businesses is None:
-        _businesses = _load_businesses(
-            os.path.join(BASE_DIR, "Business_Entities_in_Colorado_Geocoded.csv")
-        )
-
-
-def get_business_at(lat, lon):
-    _ensure_businesses()
-    dist_km = _haversine_km(lat, lon, _businesses["lats"], _businesses["lons"])
-    idx = int(np.argmin(dist_km))
-    return _businesses["names"][idx]
-
-def _load_ordinances(filepath):
+def load_ordinances(filepath):
     ordinances = {}
     with open(filepath) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row["Name"]
-            ordinances[name] = [
+        for row in csv.DictReader(f):
+            ordinances[row["Name"]] = [
                 int(row["Fully_Shielded"]),
                 int(row["Max_Limit"]),
                 int(row["Floodlights"]),
@@ -144,202 +53,168 @@ def _load_ordinances(filepath):
             ]
     return ordinances
 
-def get_dark_sky_data(lat, lon):
-    #Fetch the data at the lat long
-    viirs_val = _grid_lookup(_viirs_data[0], _viirs_data[1], lat, lon)
 
-    proj_x, proj_y = _to_albers.transform(lon, lat)
-    nlcd_val = _grid_lookup(_nlcd_data[0], _nlcd_data[1], proj_y, proj_x)
-
-    county_name = _find_county(_county_data[0], _county_data[1], lat, lon)
-
-    ordinance_vec = None
-    if county_name and county_name in _ordinances:
-        ordinance_vec = _ordinances[county_name]
-
-    business = get_business_at(lat, lon)
-
-    return {
-        "viirs": float(viirs_val) if viirs_val is not None else None,
-        "nlcd": int(nlcd_val) if nlcd_val is not None else None,
-        "county": county_name,
-        "business": business,
-        "ordinances": ordinance_vec,
-    }
-
-def _precompute_nlcd_fracs():
-    """Precompute the fraction of each NLCD class within RADIUS_FT for every cell.
-    Returns float16 array of shape (15, nrows, ncols) where each value is the
-    proportion of that class within the circular neighborhood (sums to 1 per cell)."""
-    from scipy.ndimage import convolve
-    header, data = _nlcd_data
-    cellsize = header["cellsize"]
-    radius_cells = int(np.ceil((RADIUS_FT * 0.3048) / cellsize))
-
-    # Circular footprint
-    d = np.arange(-radius_cells, radius_cells + 1)
-    xx, yy = np.meshgrid(d, d)
-    footprint = (xx ** 2 + yy ** 2 <= radius_cells ** 2).astype(np.float32)
-
-    # One convolution per class → count of that class within radius at every cell
-    counts = np.zeros((len(NLCD_CLASSES), data.shape[0], data.shape[1]), dtype=np.float32)
-    for k, cls in enumerate(NLCD_CLASSES):
-        binary = (data == cls).astype(np.float32)
-        counts[k] = convolve(binary, footprint, mode="constant", cval=0)
-
-    total = counts.sum(axis=0)
-    # Divide each class count by total to get proportion; 0 where no data
-    fracs = np.where(total > 0, counts / np.maximum(total, 1), 0).astype(np.float16)
-    return fracs
+def load_county_data(filepath):
+    sf = shapefile.Reader(filepath)
+    shapes = sf.shapes()
+    names = [rec["NAME"] for rec in sf.iterRecords()]
+    return shapes, names
 
 
-def _precompute_county_grid():
-    """Rasterize county assignments onto the VIIRS grid.
-    Returns an int16 array (nrows, ncols) with the county index, or -1."""
-    from matplotlib.path import Path
-    header, _ = _viirs_data
+def rasterize_county_grid(shapes, names, header):
+    """Assign a county index to every VIIRS pixel center."""
     nrows = int(header["nrows"])
     ncols = int(header["ncols"])
-    xll = header["xllcorner"]
-    yll = header["yllcorner"]
-    cellsize = header["cellsize"]
+    xll, yll, cs = header["xllcorner"], header["yllcorner"], header["cellsize"]
 
-    lats_vec = yll + (nrows - np.arange(nrows) - 0.5) * cellsize
-    lons_vec = xll + (np.arange(ncols) + 0.5) * cellsize
+    lats_vec = yll + (nrows - np.arange(nrows) - 0.5) * cs
+    lons_vec = xll + (np.arange(ncols) + 0.5) * cs
     lon_mesh, lat_mesh = np.meshgrid(lons_vec, lats_vec)
-    pts = np.column_stack([lon_mesh.ravel(), lat_mesh.ravel()])  # (N, 2)
+    pts = np.column_stack([lon_mesh.ravel(), lat_mesh.ravel()])
 
-    shapes, _ = _county_data
     county_grid = np.full(nrows * ncols, -1, dtype=np.int16)
     for i, s in enumerate(shapes):
         bb = s.bbox
-        bbox_mask = ((pts[:, 0] >= bb[0]) & (pts[:, 0] <= bb[2]) &
-                     (pts[:, 1] >= bb[1]) & (pts[:, 1] <= bb[3]))
-        if not bbox_mask.any():
+        mask = ((pts[:, 0] >= bb[0]) & (pts[:, 0] <= bb[2]) &
+                (pts[:, 1] >= bb[1]) & (pts[:, 1] <= bb[3]))
+        if not mask.any():
             continue
         inside = np.zeros(len(pts), dtype=bool)
-        inside[bbox_mask] = Path(s.points).contains_points(pts[bbox_mask])
+        inside[mask] = Path(s.points).contains_points(pts[mask])
         county_grid[inside] = i
 
     return county_grid.reshape(nrows, ncols)
 
 
-def build_regression_matrix(nlcd_fracs, county_grid):
-    """Build feature matrix X and target vector y using precomputed rasters.
-    All lookups are vectorized numpy array indexing — no Python loops over points.
+def build_business_score_grid(biz_lats, biz_lons, header):
+    """For each pixel, sum 1/sqrt(dist_km) for all businesses within RADIUS_KM.
+    Closer businesses contribute more (inverse square-root weighting)."""
+    nrows = int(header["nrows"])
+    ncols = int(header["ncols"])
+    xll, yll, cs = header["xllcorner"], header["yllcorner"], header["cellsize"]
 
-    Features per point:
-      - 15 NLCD fraction features (proportion of each class within 250 ft)
-      - 4  ordinance flags (Fully_Shielded, Max_Limit, Floodlights, Height_Restrictions)
-    Target y is the VIIRS radiance value.
-    """
-    v_header, v_data = _viirs_data
-    n_header, _ = _nlcd_data
-    _, county_names = _county_data
+    lats_vec = yll + (nrows - np.arange(nrows) - 0.5) * cs
+    lons_vec = xll + (np.arange(ncols) + 0.5) * cs
+    lon_mesh, lat_mesh = np.meshgrid(lons_vec, lats_vec)
 
-    nrows_v = int(v_header["nrows"])
-    xll_v, yll_v = v_header["xllcorner"], v_header["yllcorner"]
-    cs_v = v_header["cellsize"]
-    nodata_v = v_header["nodata_value"]
+    pixel_lats = lat_mesh.ravel()
+    pixel_lons = lon_mesh.ravel()
 
-    xll_n, yll_n = n_header["xllcorner"], n_header["yllcorner"]
-    cs_n = n_header["cellsize"]
-    nrows_n, ncols_n = int(n_header["nrows"]), int(n_header["ncols"])
+    # KD-tree in lat/lon degrees; convert radius to degrees (1 deg ≈ 111 km)
+    tree = KDTree(np.column_stack([biz_lats, biz_lons]))
+    pixel_pts = np.column_stack([pixel_lats, pixel_lons])
+    neighbors_list = tree.query_ball_point(pixel_pts, r=RADIUS_KM / 111.0)
 
-    # All valid VIIRS cells
-    v_rows, v_cols = np.where(v_data != nodata_v)
-    y = v_data[v_rows, v_cols].astype(np.float32)
+    scores = np.zeros(len(pixel_pts), dtype=np.float32)
+    for i, neighbors in enumerate(neighbors_list):
+        if not neighbors:
+            continue
+        dlat = (biz_lats[neighbors] - pixel_lats[i]) * 111.0
+        dlon = (biz_lons[neighbors] - pixel_lons[i]) * 111.0 * np.cos(np.radians(pixel_lats[i]))
+        dist_km = np.maximum(np.sqrt(dlat**2 + dlon**2), 0.01)
+        scores[i] = np.sum(1.0 / np.sqrt(dist_km))
 
-    # Cell-center coordinates
-    lats = yll_v + (nrows_v - v_rows - 0.5) * cs_v
-    lons = xll_v + (v_cols + 0.5) * cs_v
-
-    # NLCD: batch-transform to Albers → index into precomputed fractions raster
-    proj_xs, proj_ys = _to_albers.transform(lons, lats)
-    n_cols = np.clip(((proj_xs - xll_n) / cs_n).astype(int), 0, ncols_n - 1)
-    n_rows = np.clip(((yll_n + nrows_n * cs_n - proj_ys) / cs_n).astype(int), 0, nrows_n - 1)
-    # nlcd_fracs shape: (15, nrows, ncols) → index to get (15, n_pts) → transpose to (n_pts, 15)
-    nlcd_matrix = nlcd_fracs[:, n_rows, n_cols].T.astype(np.float32)
-
-    # Ordinances: county index → ordinance vector
-    c_idx = county_grid[v_rows, v_cols]
-    ordinance_matrix = np.zeros((len(y), 4), dtype=np.float32)
-    for ci, name in enumerate(county_names):
-        if name in _ordinances:
-            ordinance_matrix[c_idx == ci] = _ordinances[name]
-
-    X = np.hstack([nlcd_matrix, ordinance_matrix])
-    return X, y
+    return scores.reshape(nrows, ncols)
 
 
-def linearRegression():
-    """Precompute rasters, build the matrix, fit and report the linear regression."""
-    print("Precomputing NLCD fraction raster (15 convolutions)...", flush=True)
+def build_regression_matrix(viirs_header, viirs_data, biz_scores, county_grid, county_names, ordinances):
+    """Build feature matrix X (business score + 4 ordinance flags) and target y."""
+    nodata = viirs_header["nodata_value"]
+    rows, cols = np.where(viirs_data != nodata)
+    y_all = viirs_data[rows, cols].astype(np.float32)
+
+    X_rows, valid = [], []
+    for idx, (r, c) in enumerate(zip(rows, cols)):
+        county_idx = county_grid[r, c]
+        if county_idx < 0:
+            continue
+        county_name = county_names[county_idx]
+        if county_name not in ordinances:
+            continue
+        X_rows.append([biz_scores[r, c]] + ordinances[county_name])
+        valid.append(idx)
+
+    return np.array(X_rows, dtype=np.float32), y_all[valid]
+
+
+def run_regression(label, biz_lats, biz_lons, viirs_header, viirs_data, county_grid, county_names, ordinances):
+    """Fit and report a linear regression for one business data source. Returns (reg, X, y)."""
+    print(f"\n[{label}] Building business score grid...", flush=True)
     t0 = time.perf_counter()
-    nlcd_fracs = _precompute_nlcd_fracs()
+    biz_scores = build_business_score_grid(biz_lats, biz_lons, viirs_header)
     print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True)
 
-    print("Rasterizing counties onto VIIRS grid...", flush=True)
-    t0 = time.perf_counter()
-    county_grid = _precompute_county_grid()
-    print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True)
-
-    print("Building regression matrix...", flush=True)
-    t0 = time.perf_counter()
-    X, y = build_regression_matrix(nlcd_fracs, county_grid)
-    print(f"  done ({time.perf_counter() - t0:.1f}s)  shape: X={X.shape}, y={y.shape}", flush=True)
+    X, y = build_regression_matrix(viirs_header, viirs_data, biz_scores, county_grid, county_names, ordinances)
+    print(f"  X shape: {X.shape}, y shape: {y.shape}", flush=True)
 
     reg = linear_model.LinearRegression()
     reg.fit(X, y)
 
-    print("\nLinear Regression Coefficients:")
-    for name, coef in zip(FEATURE_NAMES, reg.coef_):
-        print(f"  {name}: {coef:.6f}")
-    print(f"  intercept:  {reg.intercept_:.6f}")
-    print(f"  R² score:   {reg.score(X, y):.4f}")
-
-    y_pred = reg.predict(X)
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(y, y_pred, alpha=0.4, s=10, label="samples")
-    lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
-    ax.plot(lims, lims, "r--", linewidth=1, label="perfect fit")
-    ax.set_xlabel("Actual VIIRS radiance")
-    ax.set_ylabel("Predicted VIIRS radiance")
-    ax.set_title(f"Predicted vs Actual VIIRS  (R²={reg.score(X, y):.4f})")
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
+    feature_names = ["biz_score", "fully_shielded", "max_limit", "floodlights", "height_restrictions"]
+    print(f"  Coefficients:")
+    for name, coef in zip(feature_names, reg.coef_):
+        print(f"    {name}: {coef:.6f}")
+    print(f"  intercept: {reg.intercept_:.6f}")
+    print(f"  R²:        {reg.score(X, y):.4f}")
 
     return reg, X, y
 
-def _preload_data():
-    global _viirs_data, _nlcd_data, _county_data, _ordinances
-    print("Loading raster files...", flush=True)
+
+def main():
+    print("Loading VIIRS...", flush=True)
+    viirs_header, viirs_data = parse_asc(os.path.join(BASE_DIR, "colorado_2023_viirs.asc"))
+
+    print("Loading counties...", flush=True)
+    shapes, county_names = load_county_data(os.path.join(BASE_DIR, "Counties_colorado_2005"))
+
+    print("Loading ordinances...", flush=True)
+    ordinances = load_ordinances(os.path.join(BASE_DIR, "colorado_dark_sky_ordinances.csv"))
+
+    print("Rasterizing counties...", flush=True)
     t0 = time.perf_counter()
-    _viirs_data = _parse_asc(os.path.join(BASE_DIR, "colorado_2023_viirs.asc"))
-    _nlcd_data = _parse_asc(os.path.join(BASE_DIR, "ncld_2016 1 (1).asc"), dtype=np.int16)
-    _county_data = _load_county_data(os.path.join(BASE_DIR, "Counties_colorado_2005"))
-    _ordinances = _load_ordinances(os.path.join(BASE_DIR, "colorado_dark_sky_ordinances.csv"))
-    print(f"Done ({time.perf_counter() - t0:.2f}s)\n", flush=True)
+    county_grid = rasterize_county_grid(shapes, county_names, viirs_header)
+    print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True)
 
-# bolder
-# 40.025166801818 (Lat)
-# -105.242743364816 (Long)
+    print("\nBusiness source options:")
+    for i, key in enumerate(BUSINESS_SOURCES, 1):
+        print(f"  ({i}) {key}")
+    print(f"  (3) compare both")
+    choice = input("Choice: ").strip()
 
-# El Paso
-# 38.947795585574
-#-104.87280185668
+    sources_to_run = []
+    if choice == "1":
+        sources_to_run = ["entities"]
+    elif choice == "2":
+        sources_to_run = ["osm"]
+    elif choice == "3":
+        sources_to_run = list(BUSINESS_SOURCES.keys())
+    else:
+        print("Invalid choice.")
+        return
+
+    results = {}
+    for key in sources_to_run:
+        print(f"\nLoading {key} businesses...", flush=True)
+        biz_lats, biz_lons = load_businesses(os.path.join(BASE_DIR, BUSINESS_SOURCES[key]))
+        print(f"  {len(biz_lats):,} businesses loaded", flush=True)
+        reg, X, y = run_regression(key, biz_lats, biz_lons, viirs_header, viirs_data,
+                                   county_grid, county_names, ordinances)
+        results[key] = (reg, X, y)
+
+    # Plot predicted vs actual, one subplot per source
+    fig, axes = plt.subplots(1, len(results), figsize=(7 * len(results), 6), squeeze=False)
+    for ax, (label, (reg, X, y)) in zip(axes[0], results.items()):
+        y_pred = reg.predict(X)
+        r2 = reg.score(X, y)
+        ax.scatter(y, y_pred, alpha=0.3, s=5)
+        lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
+        ax.plot(lims, lims, "r--")
+        ax.set_xlabel("Actual VIIRS radiance")
+        ax.set_ylabel("Predicted VIIRS radiance")
+        ax.set_title(f"{label}  (R²={r2:.4f})")
+    plt.tight_layout()
+    plt.show()
+
 
 if __name__ == "__main__":
-    _preload_data()
-
-    mode = input("Mode — (1) lookup single point  (2) run linear regression: ").strip()
-
-    if mode == "1":
-        lat = float(input("Enter Lat: ").strip())
-        lon = float(input("Enter Long: ").strip())
-        result = get_dark_sky_data(lat, lon)
-        print(result)
-
-    elif mode == "2":
-        linearRegression()
+    main()
