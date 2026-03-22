@@ -13,10 +13,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 RADIUS_KM = 0.5  # search radius for nearby businesses
 
-BUSINESS_SOURCES = {
-    "entities": "Business_Entities_in_Colorado_Geocoded.csv",
-    "osm":      "osm_businesses_colorado.csv",
-}
+BUSINESSES_FILE = "osm_businesses_colorado.csv"
 
 
 def parse_asc(filepath, dtype=np.float32):
@@ -175,43 +172,21 @@ def main():
     county_grid = rasterize_county_grid(shapes, county_names, viirs_header)
     print(f"  done ({time.perf_counter() - t0:.1f}s)", flush=True)
 
-    print("\nBusiness source options:")
-    for i, key in enumerate(BUSINESS_SOURCES, 1):
-        print(f"  ({i}) {key}")
-    print(f"  (3) compare both")
-    choice = input("Choice: ").strip()
+    print("Loading OSM businesses...", flush=True)
+    biz_lats, biz_lons = load_businesses(os.path.join(BASE_DIR, BUSINESSES_FILE))
+    print(f"  {len(biz_lats):,} businesses loaded", flush=True)
 
-    sources_to_run = []
-    if choice == "1":
-        sources_to_run = ["entities"]
-    elif choice == "2":
-        sources_to_run = ["osm"]
-    elif choice == "3":
-        sources_to_run = list(BUSINESS_SOURCES.keys())
-    else:
-        print("Invalid choice.")
-        return
+    reg, X, y = run_regression("osm", biz_lats, biz_lons, viirs_header, viirs_data,
+                               county_grid, county_names, ordinances)
 
-    results = {}
-    for key in sources_to_run:
-        print(f"\nLoading {key} businesses...", flush=True)
-        biz_lats, biz_lons = load_businesses(os.path.join(BASE_DIR, BUSINESS_SOURCES[key]))
-        print(f"  {len(biz_lats):,} businesses loaded", flush=True)
-        reg, X, y = run_regression(key, biz_lats, biz_lons, viirs_header, viirs_data,
-                                   county_grid, county_names, ordinances)
-        results[key] = (reg, X, y)
-
-    # Plot predicted vs actual, one subplot per source
-    fig, axes = plt.subplots(1, len(results), figsize=(7 * len(results), 6), squeeze=False)
-    for ax, (label, (reg, X, y)) in zip(axes[0], results.items()):
-        y_pred = reg.predict(X)
-        r2 = reg.score(X, y)
-        ax.scatter(y, y_pred, alpha=0.3, s=5)
-        lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
-        ax.plot(lims, lims, "r--")
-        ax.set_xlabel("Actual VIIRS radiance")
-        ax.set_ylabel("Predicted VIIRS radiance")
-        ax.set_title(f"{label}  (R²={r2:.4f})")
+    y_pred = reg.predict(X)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(y, y_pred, alpha=0.3, s=5)
+    lims = [min(y.min(), y_pred.min()), max(y.max(), y_pred.max())]
+    ax.plot(lims, lims, "r--")
+    ax.set_xlabel("Actual VIIRS radiance")
+    ax.set_ylabel("Predicted VIIRS radiance")
+    ax.set_title(f"Predicted vs Actual  (R²={reg.score(X, y):.4f})")
     plt.tight_layout()
     plt.show()
 
