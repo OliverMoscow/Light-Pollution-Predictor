@@ -1,17 +1,8 @@
 """
 fetch_osm_colorado.py
 
-Fetches light-pollution-relevant data from OpenStreetMap via the Overpass API
-for the state of Colorado and saves each category to its own CSV file.
-
-Output files:
-  osm_businesses_colorado.csv    - amenity/shop/office/tourism/leisure/craft/healthcare/club
-  osm_streetlamps_colorado.csv   - highway=street_lamp nodes
-  osm_lit_features_colorado.csv  - any feature tagged lit=*
-  osm_landuse_colorado.csv       - land use polygons (commercial/industrial/retail/etc.)
-  osm_sports_colorado.csv        - stadiums, pitches, sports centres
-  osm_transport_colorado.csv     - airports, rail yards, parking lots
-  osm_buildings_colorado.csv     - buildings with building:levels tag
+Fetches commercial businesses from OpenStreetMap via the Overpass API
+for the state of Colorado and saves to osm_businesses_colorado.csv.
 """
 
 import csv
@@ -38,7 +29,7 @@ def run_query(ql: str, retries: int = 3) -> dict:
                 OVERPASS_URL,
                 data={"data": ql},
                 headers=HEADERS,
-                timeout=240,
+                timeout=300,
             )
             resp.raise_for_status()
             return resp.json()
@@ -54,7 +45,6 @@ def extract_centroid(element: dict) -> tuple[float, float] | None:
     etype = element.get("type")
     if etype == "node":
         return element.get("lat"), element.get("lon")
-    # ways and relations: Overpass returns a 'center' key when asked
     center = element.get("center")
     if center:
         return center.get("lat"), center.get("lon")
@@ -62,7 +52,6 @@ def extract_centroid(element: dict) -> tuple[float, float] | None:
 
 
 def save_csv(rows: list[dict], filepath: str, fieldnames: list[str]) -> int:
-    """Write rows to a CSV file, return the count written."""
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -75,24 +64,58 @@ def tags(el: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1. Businesses
+# Businesses
 # ---------------------------------------------------------------------------
 
-BUSINESS_KEYS = ["amenity", "shop", "office", "tourism", "leisure", "craft", "healthcare", "club"]
+# Noise to exclude from amenity — street furniture, infrastructure, natural features
+AMENITY_EXCLUDE = {
+    "bench", "waste_basket", "waste_disposal", "recycling",
+    "bicycle_parking", "bicycle_repair_station",
+    "toilets", "shower", "drinking_water", "watering_place", "fountain",
+    "letter_box", "post_box", "vending_machine",
+    "shelter", "loading_dock", "parking_entrance",
+    "bbq", "picnic_table", "feeding_place",
+    "dog_toilet", "clock", "photo_booth",
+    "charging_station", "compressed_air",
+    "polling_station", "grave_yard", "crematorium",
+    "hunting_stand",
+}
+
+# Noise to exclude from leisure — outdoor recreation with no built lighting
+LEISURE_EXCLUDE = {
+    "pitch", "playground", "park", "garden", "picnic_table",
+    "common", "track", "bleachers", "outdoor_seating",
+    "dog_park", "slipway", "fishing", "nature_reserve",
+    "fitness_station", "bird_hide", "bandstand",
+    "swimming_area", "beach_resort",
+}
+
+# Noise to exclude from tourism — non-commercial/outdoor
+TOURISM_EXCLUDE = {
+    "information", "camp_site", "camp_pitch", "artwork",
+    "picnic_site", "viewpoint", "attraction", "caravan_site",
+    "chalet", "wilderness_hut", "alpine_hut",
+}
 
 BUSINESS_QUERY = f"""
-[out:json][timeout:180];
+[out:json][timeout:300];
 (
-  {"".join(f'node["{k}"]({BBOX});way["{k}"]({BBOX});' for k in BUSINESS_KEYS)}
+  nwr["amenity"]({BBOX});
+  nwr["shop"]({BBOX});
+  nwr["office"]({BBOX});
+  nwr["craft"]({BBOX});
+  nwr["leisure"]({BBOX});
+  nwr["tourism"]({BBOX});
 );
 out center tags;
 """
 
+BUSINESS_KEYS = ["amenity", "shop", "office", "craft", "leisure", "tourism"]
+
 BUSINESS_FIELDS = [
-    "latitude", "longitude", "entityname",
+    "latitude", "longitude", "name",
     "category", "subcategory",
-    "cuisine", "brand", "operator", "opening_hours", "is_24_7",
-    "phone", "website", "wheelchair", "outdoor_seating", "drive_through", "takeaway",
+    "brand", "operator", "opening_hours",
     "addr_street", "addr_housenumber", "addr_city", "addr_postcode",
 ]
 
@@ -105,7 +128,6 @@ def parse_businesses(data: dict) -> list[dict]:
             continue
         t = tags(el)
 
-        # Determine category/subcategory from first matching key
         category, subcategory = "", ""
         for k in BUSINESS_KEYS:
             if k in t:
@@ -113,26 +135,26 @@ def parse_businesses(data: dict) -> list[dict]:
                 subcategory = t[k]
                 break
 
-        name = t.get("name", t.get("brand", t.get("operator", "")))
-        opening = t.get("opening_hours", "")
+        if not category:
+            continue
+
+        # Skip noise
+        if category == "amenity" and subcategory in AMENITY_EXCLUDE:
+            continue
+        if category == "leisure" and subcategory in LEISURE_EXCLUDE:
+            continue
+        if category == "tourism" and subcategory in TOURISM_EXCLUDE:
+            continue
 
         rows.append({
             "latitude": lat,
             "longitude": lon,
-            "entityname": name,
+            "name": t.get("name", t.get("brand", t.get("operator", ""))),
             "category": category,
             "subcategory": subcategory,
-            "cuisine": t.get("cuisine", ""),
             "brand": t.get("brand", ""),
             "operator": t.get("operator", ""),
-            "opening_hours": opening,
-            "is_24_7": "yes" if "24/7" in opening else "",
-            "phone": t.get("phone", t.get("contact:phone", "")),
-            "website": t.get("website", t.get("contact:website", "")),
-            "wheelchair": t.get("wheelchair", ""),
-            "outdoor_seating": t.get("outdoor_seating", ""),
-            "drive_through": t.get("drive_through", ""),
-            "takeaway": t.get("takeaway", ""),
+            "opening_hours": t.get("opening_hours", ""),
             "addr_street": t.get("addr:street", ""),
             "addr_housenumber": t.get("addr:housenumber", ""),
             "addr_city": t.get("addr:city", ""),
@@ -142,289 +164,20 @@ def parse_businesses(data: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Street lamps
-# ---------------------------------------------------------------------------
-
-LAMP_QUERY = f"""
-[out:json][timeout:120];
-node["highway"="street_lamp"]({BBOX});
-out tags;
-"""
-
-LAMP_FIELDS = [
-    "latitude", "longitude",
-    "lamp_type", "light_colour", "light_direction", "support",
-    "ref", "lit",
-]
-
-
-def parse_lamps(data: dict) -> list[dict]:
-    rows = []
-    for el in data.get("elements", []):
-        t = tags(el)
-        rows.append({
-            "latitude": el.get("lat"),
-            "longitude": el.get("lon"),
-            "lamp_type": t.get("lamp_type", ""),
-            "light_colour": t.get("light:colour", ""),
-            "light_direction": t.get("light:direction", ""),
-            "support": t.get("support", ""),
-            "ref": t.get("ref", ""),
-            "lit": t.get("lit", ""),
-        })
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 3. Lit features
-# ---------------------------------------------------------------------------
-
-LIT_QUERY = f"""
-[out:json][timeout:180];
-(
-  node["lit"]({BBOX});
-  way["lit"]({BBOX});
-  relation["lit"]({BBOX});
-);
-out center tags;
-"""
-
-LIT_FIELDS = [
-    "latitude", "longitude",
-    "osm_type", "lit_value",
-    "feature_type", "road_type", "name",
-]
-
-
-def parse_lit(data: dict) -> list[dict]:
-    rows = []
-    for el in data.get("elements", []):
-        lat, lon = extract_centroid(el)
-        if lat is None:
-            continue
-        t = tags(el)
-        # Determine the primary feature type
-        feature_type = (
-            t.get("highway") or t.get("amenity") or t.get("landuse") or
-            t.get("leisure") or t.get("building") or el.get("type", "")
-        )
-        rows.append({
-            "latitude": lat,
-            "longitude": lon,
-            "osm_type": el.get("type", ""),
-            "lit_value": t.get("lit", ""),
-            "feature_type": feature_type,
-            "road_type": t.get("highway", ""),
-            "name": t.get("name", ""),
-        })
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 4. Land use
-# ---------------------------------------------------------------------------
-
-LANDUSE_TYPES = [
-    "commercial", "retail", "industrial", "residential",
-    "greenhouse_horticulture", "farmland", "construction",
-]
-
-LANDUSE_QUERY = f"""
-[out:json][timeout:180];
-(
-  {"".join(f'way["landuse"="{lu}"]({BBOX});relation["landuse"="{lu}"]({BBOX});' for lu in LANDUSE_TYPES)}
-);
-out center tags;
-"""
-
-LANDUSE_FIELDS = ["latitude", "longitude", "landuse", "name", "operator"]
-
-
-def parse_landuse(data: dict) -> list[dict]:
-    rows = []
-    for el in data.get("elements", []):
-        lat, lon = extract_centroid(el)
-        if lat is None:
-            continue
-        t = tags(el)
-        rows.append({
-            "latitude": lat,
-            "longitude": lon,
-            "landuse": t.get("landuse", ""),
-            "name": t.get("name", ""),
-            "operator": t.get("operator", ""),
-        })
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 5. Sports facilities
-# ---------------------------------------------------------------------------
-
-SPORTS_QUERY = f"""
-[out:json][timeout:120];
-(
-  node["leisure"~"^(stadium|pitch|sports_centre)$"]({BBOX});
-  way["leisure"~"^(stadium|pitch|sports_centre)$"]({BBOX});
-  relation["leisure"~"^(stadium|pitch|sports_centre)$"]({BBOX});
-);
-out center tags;
-"""
-
-SPORTS_FIELDS = [
-    "latitude", "longitude", "name",
-    "leisure_type", "sport", "floodlight", "capacity", "operator",
-]
-
-
-def parse_sports(data: dict) -> list[dict]:
-    rows = []
-    for el in data.get("elements", []):
-        lat, lon = extract_centroid(el)
-        if lat is None:
-            continue
-        t = tags(el)
-        rows.append({
-            "latitude": lat,
-            "longitude": lon,
-            "name": t.get("name", ""),
-            "leisure_type": t.get("leisure", ""),
-            "sport": t.get("sport", ""),
-            "floodlight": t.get("floodlight", ""),
-            "capacity": t.get("capacity", ""),
-            "operator": t.get("operator", ""),
-        })
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 6. Transport (airports, rail yards, parking)
-# ---------------------------------------------------------------------------
-
-TRANSPORT_QUERY = f"""
-[out:json][timeout:180];
-(
-  node["aeroway"="aerodrome"]({BBOX});
-  way["aeroway"="aerodrome"]({BBOX});
-  relation["aeroway"="aerodrome"]({BBOX});
-  node["railway"="yard"]({BBOX});
-  way["railway"="yard"]({BBOX});
-  node["amenity"="parking"]({BBOX});
-  way["amenity"="parking"]({BBOX});
-);
-out center tags;
-"""
-
-TRANSPORT_FIELDS = [
-    "latitude", "longitude", "name",
-    "transport_type", "subtype",
-    "operator", "access", "parking_type",
-    "lit", "fee",
-]
-
-
-def parse_transport(data: dict) -> list[dict]:
-    rows = []
-    for el in data.get("elements", []):
-        lat, lon = extract_centroid(el)
-        if lat is None:
-            continue
-        t = tags(el)
-        if "aeroway" in t:
-            ttype, subtype = "aeroway", t.get("aeroway", "")
-        elif "railway" in t:
-            ttype, subtype = "railway", t.get("railway", "")
-        else:
-            ttype, subtype = "parking", t.get("parking", "surface")
-
-        rows.append({
-            "latitude": lat,
-            "longitude": lon,
-            "name": t.get("name", t.get("ref", "")),
-            "transport_type": ttype,
-            "subtype": subtype,
-            "operator": t.get("operator", ""),
-            "access": t.get("access", ""),
-            "parking_type": t.get("parking", ""),
-            "lit": t.get("lit", ""),
-            "fee": t.get("fee", ""),
-        })
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 7. Buildings with height info
-# ---------------------------------------------------------------------------
-
-BUILDINGS_QUERY = f"""
-[out:json][timeout:180];
-(
-  way["building"]["building:levels"]({BBOX});
-  relation["building"]["building:levels"]({BBOX});
-);
-out center tags;
-"""
-
-BUILDINGS_FIELDS = [
-    "latitude", "longitude", "name",
-    "building_type", "levels", "height",
-    "operator", "amenity",
-]
-
-
-def parse_buildings(data: dict) -> list[dict]:
-    rows = []
-    for el in data.get("elements", []):
-        lat, lon = extract_centroid(el)
-        if lat is None:
-            continue
-        t = tags(el)
-        rows.append({
-            "latitude": lat,
-            "longitude": lon,
-            "name": t.get("name", ""),
-            "building_type": t.get("building", ""),
-            "levels": t.get("building:levels", ""),
-            "height": t.get("height", ""),
-            "operator": t.get("operator", ""),
-            "amenity": t.get("amenity", ""),
-        })
-    return rows
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-CATEGORIES = [
-    ("Businesses",    BUSINESS_QUERY,  parse_businesses, BUSINESS_FIELDS,  "osm_businesses_colorado.csv"),
-    ("Street lamps",  LAMP_QUERY,      parse_lamps,      LAMP_FIELDS,      "osm_streetlamps_colorado.csv"),
-    ("Lit features",  LIT_QUERY,       parse_lit,        LIT_FIELDS,       "osm_lit_features_colorado.csv"),
-    ("Land use",      LANDUSE_QUERY,   parse_landuse,    LANDUSE_FIELDS,   "osm_landuse_colorado.csv"),
-    ("Sports",        SPORTS_QUERY,    parse_sports,     SPORTS_FIELDS,    "osm_sports_colorado.csv"),
-    ("Transport",     TRANSPORT_QUERY, parse_transport,  TRANSPORT_FIELDS, "osm_transport_colorado.csv"),
-    ("Buildings",     BUILDINGS_QUERY, parse_buildings,  BUILDINGS_FIELDS, "osm_buildings_colorado.csv"),
-]
-
-
 def main():
-    print("Fetching OSM data for Colorado...\n")
-    total_start = time.perf_counter()
+    print("Fetching OSM business data for Colorado...\n")
+    t0 = time.perf_counter()
 
-    for name, query, parser, fields, outfile in CATEGORIES:
-        print(f"[{name}] Querying Overpass API...", flush=True)
-        t0 = time.perf_counter()
-        data = run_query(query)
-        elapsed = time.perf_counter() - t0
+    print("Querying Overpass API...", flush=True)
+    data = run_query(BUSINESS_QUERY)
+    elapsed = time.perf_counter() - t0
 
-        rows = parser(data)
-        count = save_csv(rows, outfile, fields)
-        print(f"[{name}] {count:,} rows → {outfile}  ({elapsed:.1f}s)\n", flush=True)
-
-        # Be polite to the public Overpass instance
-        time.sleep(2)
-
-    print(f"Done. Total time: {time.perf_counter() - total_start:.1f}s")
+    rows = parse_businesses(data)
+    count = save_csv(rows, "osm_businesses_colorado.csv", BUSINESS_FIELDS)
+    print(f"{count:,} businesses → osm_businesses_colorado.csv  ({elapsed:.1f}s)")
 
 
 if __name__ == "__main__":
